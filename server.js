@@ -31,12 +31,17 @@ const safeEqual = (a, b) => {
 };
 
 // ---------- Pano (Upstash) ----------
-const KEY = 'bot:settings';
-const defaults = {
-  autoBan: true,
+const WELCOME_DEFAULT = 'Hoş geldin {user}! 🎉 Aramıza katıldığın için çok mutluyuz.';
+
+// Ana sunucu eski anahtarı kullanır, diğer sunucuların her biri kendi anahtarını kullanır.
+const keyFor = (gid) => (gid === GUILD_ID ? 'bot:settings' : `bot:settings:${gid}`);
+
+// Ana sunucuda otomatik ban açık, yeni sunucularda her şey kapalı başlar.
+const defaultsFor = (gid) => ({
+  autoBan: gid === GUILD_ID,
   welcomeChannelId: '',
-  welcomeMessage: 'Hoş geldin {user}! 🎉 Aramıza katıldığın için çok mutluyuz.',
-};
+  welcomeMessage: WELCOME_DEFAULT,
+});
 
 async function redis(command) {
   const res = await fetch(UPSTASH_REDIS_REST_URL, {
@@ -49,13 +54,13 @@ async function redis(command) {
   return data.result;
 }
 
-async function loadSettings() {
-  const raw = await redis(['GET', KEY]);
-  return { ...defaults, ...(raw ? JSON.parse(raw) : {}) };
+async function loadSettings(gid) {
+  const raw = await redis(['GET', keyFor(gid)]);
+  return { ...defaultsFor(gid), ...(raw ? JSON.parse(raw) : {}) };
 }
 
-async function saveSettings(cfg) {
-  await redis(['SET', KEY, JSON.stringify(cfg)]);
+async function saveSettings(gid, cfg) {
+  await redis(['SET', keyFor(gid), JSON.stringify(cfg)]);
 }
 
 // ---------- Discord ----------
@@ -72,8 +77,21 @@ async function discord(method, path, reason) {
   return data;
 }
 
-async function getTextChannels() {
-  const all = await discord('GET', `/guilds/${GUILD_ID}/channels`);
+async function getBotGuilds() {
+  const list = await discord('GET', '/users/@me/guilds?limit=200');
+  return list.map((g) => ({ id: g.id, name: g.name }));
+}
+
+// Gelen sunucu ID'sinin gerçekten botun bulunduğu bir sunucu olduğunu doğrular
+async function resolveGuild(id) {
+  const guilds = await getBotGuilds();
+  const found = guilds.find((g) => g.id === String(id || ''));
+  if (!found) throw new Error('Bu sunucu botun bulunduğu sunucular arasında değil.');
+  return found.id;
+}
+
+async function getTextChannels(gid) {
+  const all = await discord('GET', `/guilds/${gid}/channels`);
   return all.filter((c) => c.type === 0 || c.type === 5).sort((a, b) => a.position - b.position);
 }
 
@@ -95,6 +113,7 @@ table{width:100%;border-collapse:collapse}
 td,th{padding:6px;text-align:left;border-bottom:1px solid #3f4147}
 .msg{background:#248046;padding:8px 12px;border-radius:4px;margin-bottom:16px}
 .err{background:#da373c;padding:8px 12px;border-radius:4px;margin-bottom:16px}
+.note{font-size:13px;opacity:.7}
 </style></head><body>${body}</body></html>`;
 
 const loginPage = (error) =>
@@ -136,6 +155,7 @@ app.use(
 
 const requireAuth = (req, res, next) => (req.session.auth ? next() : res.redirect('/login'));
 const flash = (req, text) => { req.session.flash = text; };
+const back = (gid) => '/?g=' + encodeURIComponent(String(gid || '').replace(/\D/g, ''));
 
 app.get('/health', (req, res) => res.send('ok'));
 
@@ -169,25 +189,37 @@ app.get('/', requireAuth, async (req, res) => {
   const msg = req.session.flash;
   delete req.session.flash;
   try {
+    const guilds = await getBotGuilds();
+    if (!guilds.length) throw new Error('Bot hiçbir sunucuda değil.');
+    const wanted = String(req.query.g || '');
+    const gid = (guilds.find((g) => g.id === wanted) || guilds.find((g) => g.id === GUILD_ID) || guilds[0]).id;
+
     const [me, guild, channels, bans, cfg] = await Promise.all([
       discord('GET', '/users/@me'),
-      discord('GET', `/guilds/${GUILD_ID}?with_counts=true`),
-      getTextChannels(),
-      discord('GET', `/guilds/${GUILD_ID}/bans?limit=1000`),
-      loadSettings(),
+      discord('GET', `/guilds/${gid}?with_counts=true`),
+      getTextChannels(gid).catch(() => []),
+      discord('GET', `/guilds/${gid}/bans?limit=1000`).catch(() => null),
+      loadSettings(gid),
     ]);
 
-    const options = channels
-      .map((c) => `<option value="${c.id}" ${c.id === cfg.welcomeChannelId ? 'selected' : ''}>#${esc(c.name)}</option>`)
+    const serverOptions = guilds
+      .map((g) => `<option value="${esc(g.id)}" ${g.id === gid ? 'selected' : ''}>${esc(g.name)}</option>`)
       .join('');
 
-    const rows = bans
+    const channelOptions =
+      `<option value="" ${cfg.welcomeChannelId ? '' : 'selected'}>— Karşılama mesajı kapalı —</option>` +
+      channels
+        .map((c) => `<option value="${esc(c.id)}" ${c.id === cfg.welcomeChannelId ? 'selected' : ''}>#${esc(c.name)}</option>`)
+        .join('');
+
+    const rows = (bans || [])
       .map(
         (b) => `<tr>
         <td>${esc(b.user.global_name || b.user.username)}</td>
         <td>${esc(b.user.id)}</td>
         <td>${esc(b.reason || '-')}</td>
         <td><form method="post" action="/unban">
+          <input type="hidden" name="g" value="${esc(gid)}">
           <input type="hidden" name="id" value="${esc(b.user.id)}">
           <button class="red">Banı Aç</button></form></td></tr>`
       )
@@ -197,6 +229,16 @@ app.get('/', requireAuth, async (req, res) => {
       page(`
       <h1>🤖 Bot Paneli</h1>
       ${msg ? `<div class="${msg.startsWith('Hata') ? 'err' : 'msg'}">${esc(msg)}</div>` : ''}
+
+      <div class="card">
+        <form method="get" action="/">
+          <label>Yönetilen sunucu</label>
+          <select name="g">${serverOptions}</select>
+          <button>Sunucuyu Aç</button>
+        </form>
+        ${gid !== GUILD_ID ? '<p class="note">Bu sunucunun ayarları ayrıdır. Yeni sunucularda otomatik ban ve karşılama varsayılan olarak kapalı başlar.</p>' : ''}
+      </div>
+
       <div class="card">
         <b>Bot:</b> ${esc(me.username)} &nbsp;|&nbsp;
         <b>Sunucu:</b> ${esc(guild.name)} &nbsp;|&nbsp;
@@ -207,19 +249,21 @@ app.get('/', requireAuth, async (req, res) => {
       <div class="card">
         <h2>Ayarlar</h2>
         <form method="post" action="/settings">
+          <input type="hidden" name="g" value="${esc(gid)}">
           <label><input type="checkbox" name="autoBan" ${cfg.autoBan ? 'checked' : ''}>
             Sunucudan çıkanları otomatik banla</label>
           <label>Karşılama kanalı</label>
-          <select name="welcomeChannelId">${options}</select>
+          <select name="welcomeChannelId">${channelOptions}</select>
           <label>Karşılama mesajı (<code>{user}</code> yazan yere yeni üyenin etiketi gelir)</label>
           <textarea name="welcomeMessage" rows="3">${esc(cfg.welcomeMessage)}</textarea>
           <button>Kaydet</button>
         </form>
-        <p style="font-size:13px;opacity:.7">Değişiklikler bota en geç 15 saniye içinde ulaşır.</p>
+        <p class="note">Değişiklikler bota en geç 15 saniye içinde ulaşır.</p>
       </div>
 
       <div class="card">
-        <h2>Banlı Kullanıcılar (${bans.length})</h2>
+        <h2>Banlı Kullanıcılar (${bans ? bans.length : '?'})</h2>
+        ${bans ? '' : '<p class="note">Ban listesi alınamadı. Botun bu sunucuda "Üyeleri Banla" yetkisi olmayabilir.</p>'}
         <table>
           <tr><th>Kullanıcı</th><th>ID</th><th>Sebep</th><th></th></tr>
           ${rows || '<tr><td colspan="4">Banlı kimse yok.</td></tr>'}
@@ -233,35 +277,43 @@ app.get('/', requireAuth, async (req, res) => {
 });
 
 app.post('/settings', requireAuth, async (req, res) => {
+  let gid = req.body.g;
   try {
-    const cfg = await loadSettings();
+    gid = await resolveGuild(req.body.g);
+    const cfg = await loadSettings(gid);
     cfg.autoBan = req.body.autoBan === 'on';
 
     const channelId = String(req.body.welcomeChannelId || '');
-    const channels = await getTextChannels();
-    if (channels.some((c) => c.id === channelId)) cfg.welcomeChannelId = channelId;
+    if (channelId === '') {
+      cfg.welcomeChannelId = '';
+    } else {
+      const channels = await getTextChannels(gid);
+      if (channels.some((c) => c.id === channelId)) cfg.welcomeChannelId = channelId;
+    }
 
     const message = String(req.body.welcomeMessage || '').trim().slice(0, 1500);
     if (message) cfg.welcomeMessage = message;
 
-    await saveSettings(cfg);
+    await saveSettings(gid, cfg);
     flash(req, 'Ayarlar kaydedildi.');
   } catch (err) {
     flash(req, 'Hata: ' + err.message);
   }
-  res.redirect('/');
+  res.redirect(back(gid));
 });
 
 app.post('/unban', requireAuth, async (req, res) => {
+  let gid = req.body.g;
   try {
+    gid = await resolveGuild(req.body.g);
     const id = String(req.body.id || '');
     if (!/^\d{5,25}$/.test(id)) throw new Error('Geçersiz ID');
-    await discord('DELETE', `/guilds/${GUILD_ID}/bans/${id}`, 'Panelden ban kaldırıldı');
+    await discord('DELETE', `/guilds/${gid}/bans/${id}`, 'Panelden ban kaldırıldı');
     flash(req, 'Ban kaldırıldı.');
   } catch (err) {
     flash(req, 'Hata: ' + err.message);
   }
-  res.redirect('/');
+  res.redirect(back(gid));
 });
 
 const port = process.env.PORT || 3000;
