@@ -30,6 +30,8 @@ const safeEqual = (a, b) => {
   return crypto.timingSafeEqual(ha, hb);
 };
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ---------- Pano (Upstash) ----------
 const WELCOME_DEFAULT = 'Hoş geldin {user}! 🎉 Aramıza katıldığın için çok mutluyuz.';
 
@@ -64,7 +66,8 @@ async function saveSettings(gid, cfg) {
 }
 
 // ---------- Discord ----------
-async function discord(method, path, reason) {
+// Hız sınırına takılırsa kısa süre bekleyip en fazla 2 kez tekrar dener.
+async function discord(method, path, reason, attempt = 0) {
   const headers = {
     Authorization: `Bot ${DISCORD_TOKEN}`,
     'User-Agent': 'DiscordBot (discord-panel, 1.0)',
@@ -73,19 +76,39 @@ async function discord(method, path, reason) {
   const res = await fetch(`https://discord.com/api/v10${path}`, { method, headers });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => null);
+
+  if (res.status === 429) {
+    const retryAfter = Number(data && data.retry_after) || 1;
+    console.error(
+      `Discord hız sınırı: ${method} ${path} (bekleme=${retryAfter}sn, global=${data && data.global}, deneme=${attempt + 1})`
+    );
+    if (attempt < 2 && retryAfter <= 5) {
+      await sleep(Math.ceil(retryAfter * 1000) + 250);
+      return discord(method, path, reason, attempt + 1);
+    }
+    throw new Error(`Discord hız sınırı: yaklaşık ${Math.ceil(retryAfter)} saniye sonra tekrar dene.`);
+  }
+
   if (!res.ok) throw new Error((data && data.message) || `Discord hatası (${res.status})`);
   return data;
 }
 
-async function getBotGuilds() {
+// Botun bulunduğu sunucuların listesi (1 dakika hafızada tutulur)
+let guildsCache = { at: 0, list: [] };
+async function getBotGuilds(force = false) {
+  if (!force && guildsCache.list.length && Date.now() - guildsCache.at < 60 * 1000) {
+    return guildsCache.list;
+  }
   const list = await discord('GET', '/users/@me/guilds?limit=200');
-  return list.map((g) => ({ id: g.id, name: g.name }));
+  guildsCache = { at: Date.now(), list: list.map((g) => ({ id: g.id, name: g.name })) };
+  return guildsCache.list;
 }
 
 // Gelen sunucu ID'sinin gerçekten botun bulunduğu bir sunucu olduğunu doğrular
 async function resolveGuild(id) {
-  const guilds = await getBotGuilds();
-  const found = guilds.find((g) => g.id === String(id || ''));
+  const wanted = String(id || '');
+  let found = (await getBotGuilds()).find((g) => g.id === wanted);
+  if (!found) found = (await getBotGuilds(true)).find((g) => g.id === wanted);
   if (!found) throw new Error('Bu sunucu botun bulunduğu sunucular arasında değil.');
   return found.id;
 }
@@ -263,7 +286,7 @@ app.get('/', requireAuth, async (req, res) => {
 
       <div class="card">
         <h2>Banlı Kullanıcılar (${bans ? bans.length : '?'})</h2>
-        ${bans ? '' : '<p class="note">Ban listesi alınamadı. Botun bu sunucuda "Üyeleri Banla" yetkisi olmayabilir.</p>'}
+        ${bans ? '' : '<p class="note">Ban listesi alınamadı (hız sınırı ya da botun bu sunucuda "Üyeleri Banla" yetkisi yok). Biraz bekleyip sayfayı yenile.</p>'}
         <table>
           <tr><th>Kullanıcı</th><th>ID</th><th>Sebep</th><th></th></tr>
           ${rows || '<tr><td colspan="4">Banlı kimse yok.</td></tr>'}
@@ -297,6 +320,7 @@ app.post('/settings', requireAuth, async (req, res) => {
     await saveSettings(gid, cfg);
     flash(req, 'Ayarlar kaydedildi.');
   } catch (err) {
+    console.error('Ayar kaydetme hatası:', err.message);
     flash(req, 'Hata: ' + err.message);
   }
   res.redirect(back(gid));
@@ -311,6 +335,7 @@ app.post('/unban', requireAuth, async (req, res) => {
     await discord('DELETE', `/guilds/${gid}/bans/${id}`, 'Panelden ban kaldırıldı');
     flash(req, 'Ban kaldırıldı.');
   } catch (err) {
+    console.error('Ban kaldırma hatası:', err.message);
     flash(req, 'Hata: ' + err.message);
   }
   res.redirect(back(gid));
